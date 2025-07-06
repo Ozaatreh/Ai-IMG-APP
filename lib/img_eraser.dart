@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
-
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:image/image.dart' as img;
@@ -9,7 +9,7 @@ import 'package:image_magic_eraser/image_magic_eraser.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
-
+import 'package:flutter/foundation.dart'; // for consolidateHttpClientResponseBytes
 
 class MagicEraserPage extends StatefulWidget {
   @override
@@ -25,15 +25,36 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
   double brushSize = 20.0;
   bool isDrawing = false;
   Offset? currentPosition;
- 
- void initState() async {
+
+  @override
+  void initState() {
     super.initState();
-    // await InpaintingService.instance.initializeOrt('assets/lama_fp32.onnx');
-    }
+    _initModel();
+  }
+
+  Future<void> _initModel() async {
+    final modelPath = await _downloadModelIfNeeded();
+    await InpaintingService.instance.initializeOrt(modelPath);
+  }
+
+  Future<String> _downloadModelIfNeeded() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final modelPath = '${dir.path}/lama_fp32.onnx';
+    final file = File(modelPath);
+
+    if (await file.exists()) return modelPath;
+
+    final url = 'https://yourdomain.com/models/lama_fp32.onnx'; // ✅ REPLACE THIS
+    final request = await HttpClient().getUrl(Uri.parse(url));
+    final response = await request.close();
+    final bytes = await consolidateHttpClientResponseBytes(response);
+    await file.writeAsBytes(bytes);
+    return modelPath;
+  }
+
   Future<void> pickImage() async {
     final file = await ImagePicker().pickImage(source: ImageSource.gallery);
     if (file == null) return;
-
     final bytes = await file.readAsBytes();
     setState(() {
       original = bytes;
@@ -41,7 +62,7 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
       selectedPoints.clear();
     });
   }
-  
+
   Future<void> erase() async {
     if (original == null || selectedPoints.isEmpty) return;
     setState(() => loading = true);
@@ -61,31 +82,32 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
 
       final scaleX = image.width / renderBox.size.width;
       final scaleY = image.height / renderBox.size.height;
+      final scaledBrushSize = brushSize * ((scaleX + scaleY) / 2);
 
-      // Convert points to the required format
-      final polygons = selectedPoints.map((point) {
-        return {
-          'x': (point.dx * scaleX).toDouble(),
-          'y': (point.dy * scaleY).toDouble(),
-        };
+      // Turn points into circular polygon regions
+      final regions = selectedPoints.map((center) {
+        final scaledCenter = Offset(center.dx * scaleX, center.dy * scaleY);
+        const int steps = 12;
+        final radius = scaledBrushSize / 2;
+
+        return List.generate(steps, (i) {
+          final angle = 2 * pi * i / steps;
+          final dx = scaledCenter.dx + radius * cos(angle);
+          final dy = scaledCenter.dy + radius * sin(angle);
+          return {'x': dx, 'y': dy};
+        });
       }).toList();
 
-      // Perform inpainting with the correct parameter format
-      final uiImage = await InpaintingService.instance.inpaint(
-        original!,
-        [polygons], // List of polygons where each polygon is a list of points
-      );
-
+      final uiImage = await InpaintingService.instance.inpaint(original!, regions);
       final byteData = await uiImage.toByteData(format: ui.ImageByteFormat.png);
+
       setState(() {
         erased = byteData!.buffer.asUint8List();
         loading = false;
       });
     } catch (e) {
       setState(() => loading = false);
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: ${e.toString()}')),
-      );
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Error: ${e.toString()}')));
     }
   }
 
@@ -127,9 +149,7 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
   }
 
   void clearSelection() {
-    setState(() {
-      selectedPoints.clear();
-    });
+    setState(() => selectedPoints.clear());
   }
 
   @override
@@ -182,13 +202,7 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
                 decoration: BoxDecoration(
                   color: Colors.white,
                   borderRadius: BorderRadius.circular(18),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black12,
-                      blurRadius: 8,
-                      offset: Offset(0, 4),
-                    )
-                  ],
+                  boxShadow: [BoxShadow(color: Colors.black12, blurRadius: 8, offset: Offset(0, 4))],
                 ),
                 child: original != null
                     ? ClipRRect(
@@ -203,12 +217,7 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
                               children: [
                                 Image.memory(erased ?? original!, fit: BoxFit.contain),
                                 CustomPaint(
-                                  painter: SelectionPainter(
-                                    selectedPoints,
-                                    brushSize,
-                                    isDrawing,
-                                    currentPosition,
-                                  ),
+                                  painter: SelectionPainter(selectedPoints, brushSize, isDrawing, currentPosition),
                                 ),
                               ],
                             ),
@@ -216,10 +225,7 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
                         ),
                       )
                     : Center(
-                        child: Text(
-                          "Tap 'Choose' to select an image",
-                          style: TextStyle(color: Colors.grey[600]),
-                        ),
+                        child: Text("Tap 'Choose' to select an image", style: TextStyle(color: Colors.grey[600])),
                       ),
               ),
             ),
@@ -237,11 +243,10 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.teal[800],
                         padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       ),
-                    ),),
+                    ),
+                  ),
                   const SizedBox(width: 10),
                   Expanded(
                     child: ElevatedButton.icon(
@@ -251,11 +256,10 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.blue,
                         padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       ),
-                    ),),
+                    ),
+                  ),
                   const SizedBox(width: 10),
                   Expanded(
                     child: ElevatedButton.icon(
@@ -265,11 +269,10 @@ class _MagicEraserPageState extends State<MagicEraserPage> {
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.indigo,
                         padding: const EdgeInsets.symmetric(vertical: 14),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       ),
-                    ),),
+                    ),
+                  ),
                 ],
               )
           ],
@@ -291,26 +294,14 @@ class SelectionPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
       ..color = Colors.red.withOpacity(isDrawing ? 0.7 : 0.5)
-      ..strokeWidth = brushSize
-      ..strokeCap = StrokeCap.round
-      ..style = PaintingStyle.stroke;
+      ..style = PaintingStyle.fill;
 
-    // Draw the path
-    if (points.length > 1) {
-      final path = Path()..moveTo(points[0].dx, points[0].dy);
-      for (int i = 1; i < points.length; i++) {
-        path.lineTo(points[i].dx, points[i].dy);
-      }
-      canvas.drawPath(path, paint..style = PaintingStyle.stroke);
+    for (final point in points) {
+      canvas.drawCircle(point, brushSize / 2, paint);
     }
 
-    // Draw a circle at the current position if drawing
     if (isDrawing && currentPosition != null) {
-      canvas.drawCircle(
-        currentPosition!,
-        brushSize / 2,
-        paint..style = PaintingStyle.fill,
-      );
+      canvas.drawCircle(currentPosition!, brushSize / 2, paint..color = Colors.red.withOpacity(0.3));
     }
   }
 
